@@ -13,6 +13,10 @@
   的内容当作高光细节留下（即使多张非参照帧内容一致）。
 - 饱和裁切、曝光差异、配准残差不直接当作运动：曝光按快门时间补偿、
   裁切像素不参与比较、比较在模糊 + 邻域包络下进行。
+- 融合恢复按通道裁决、不确定遮罩按像素裁决：静态区域某通道在全部帧
+  都过曝/欠曝时，该通道保留参照帧值（绝不写零而造成偏色），其余可
+  恢复通道仍保留融合细节；只要有一个通道无法恢复，该像素即标为不
+  确定；三通道全部可恢复时才视为确定的融合结果。
 - 全组曝光都缺失或无法可靠判断的区域：保留参照内容并标为不确定。
 """
 
@@ -304,6 +308,9 @@ def classify_and_merge(aligned, times, ref_idx, masks, common):
     dynamic = (dyn_u > 0) & common_b
 
     # ---- 静态区域加权融合（Debevec 帽式权重，裁切处权重为 0）----
+    # 恢复按通道裁决：某通道在全部帧都裁切（权重和为 0）时，该通道
+    # 保留参照帧值，而不是像整像素裁决那样被写成 0 造成偏色；
+    # 其余仍有权重的通道保留多帧融合的细节。
     acc = np.zeros((h, w, 3), np.float32)
     wsum = np.zeros((h, w, 3), np.float32)
     for i in range(n):
@@ -313,20 +320,26 @@ def classify_and_merge(aligned, times, ref_idx, masks, common):
         wgt *= (masks[i] > 0)[..., None].astype(np.float32)
         acc += wgt * (_to_linear(aligned[i]) / t[i])
         wsum += wgt
-    has_data = wsum.max(axis=2) > 1e-6
-    radiance = np.where(wsum > 1e-6, acc / np.maximum(wsum, 1e-6), 0.0)
+    ch_has_data = wsum > 1e-6                    # 逐通道：该通道是否可恢复
+    radiance = np.where(ch_has_data, acc / np.maximum(wsum, 1e-6),
+                        ref_lin / t_ref)         # 缺失通道回退参照值
 
     ref_radiance = ref_lin / t_ref
-    out = np.where(has_data[..., None], radiance, ref_radiance)
-    out = np.where(dynamic[..., None], ref_radiance, out)   # 动态：只用参照
-    out = np.where(common_b[..., None], out, ref_radiance)  # 重叠区外：参照
+    static = common_b & ~dynamic
+    # 静态公共区域：可恢复通道用融合结果，缺失通道保留参照；
+    # 动态区域只取参照；公共重叠区外回退参照。
+    out = np.where(static[..., None], radiance, ref_radiance)
     display = out * t_ref                                    # 回到参照曝光域
 
     # ---- 不确定区域：保留参照内容并标注 ----
+    # 遮罩按像素裁决：静态区域只要有一个通道在全部帧都裁切，就视为
+    # 部分缺失、颜色不可信（该通道保留了参照值），标为不确定；
+    # 三通道全部可恢复才是确定的融合结果。
     ref_clipped = ref_hi | ref_lo
+    some_ch_missing = static & (~ch_has_data).any(axis=2)
     uncertain = ((~common_b)                       # 非公共重叠区，只有参照可用
                  | (dynamic & ref_clipped)         # 动态且参照已裁切，无法恢复
-                 | (~has_data & ~dynamic))         # 全组曝光都缺失细节
+                 | some_ch_missing)                # 存在全组裁切的颜色通道
     return display.astype(np.float32), dynamic, uncertain, common_b
 
 

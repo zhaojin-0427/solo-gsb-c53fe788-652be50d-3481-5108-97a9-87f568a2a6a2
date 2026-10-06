@@ -212,3 +212,127 @@ def test_rejects_corrupt_and_mismatched_images():
 def test_rejects_bad_reference_index():
     with pytest.raises(PipelineError, match="参照"):
         run_pipeline(make_jpegs(), TIMES, 5)
+
+
+# ---------------------------------------------------------------------------
+# 逐通道裁切：某一通道在全部帧过曝，其它通道仍有有效曝光
+# 旧逻辑按整像素裁决（任一通道有权重即融合），缺失通道被写成 0 -> 偏色，
+# 且部分缺失的像素漏标遮罩。修复后：缺失通道保留参照值、可恢复通道保留
+# 融合细节，部分缺失像素标为不确定，全通道可恢复才确定。
+# ---------------------------------------------------------------------------
+
+# 静态彩色区域（BGR，辐射度，参照曝光为单位）。
+# 用大块平滑色块（边缘羽化、中心平核）避免硬边在 JPEG + 模糊后触发运动
+# 分类；背景带随机纹理保证 ORB 配准。下面坐标为平核区域。
+PATCH_R1 = (35, 65, 80, 150)    # R=5.0 全组裁切，B/G 正常
+PATCH_R2 = (35, 65, 175, 245)   # R=1.5 参照过曝、短曝光可恢复
+PATCH_R3 = (165, 195, 110, 180) # B=G=R=8.0 全组三通道裁切
+
+
+def _soft_rect(shape, patch, band=16.0):
+    """边缘羽化、中心恒为 1 的权重（核心区域颜色完全平坦）。"""
+    y0, y1, x0, x1 = patch
+    yy, xx = np.mgrid[0:shape[0], 0:shape[1]].astype(np.float32)
+    d = np.minimum(np.minimum(xx - x0, x1 - xx),
+                   np.minimum(yy - y0, y1 - y0))
+    return np.clip(d / band, 0.0, 1.0)
+
+
+def build_color_scene():
+    """中性灰背景（带纹理便于配准）+ 三个不同裁切情况的平滑彩色块。"""
+    rng = np.random.default_rng(7)
+    noise = rng.normal(0.0, 1.0, (H, W)).astype(np.float32)
+    tex = 0.05 * cv2.GaussianBlur(noise, (0, 0), 1.2)
+    base = 0.4
+    b = np.full((H, W), base, np.float32) * (1.0 + tex)
+    g = b.copy()
+    r = b.copy()
+
+    def blend(patch, vb, vg, vr):
+        nonlocal b, g, r
+        m = _soft_rect((H, W), patch)
+        b = b * (1.0 - m) + vb * m
+        g = g * (1.0 - m) + vg * m
+        r = r * (1.0 - m) + vr * m
+
+    blend(PATCH_R1, 0.4, 0.25, 5.0)
+    blend(PATCH_R2, 0.4, 0.25, 1.5)
+    blend(PATCH_R3, 8.0, 8.0, 8.0)
+    return cv2.merge([b, g, r])
+
+
+def render_color(scene_bgr, ratio):
+    lin = np.clip(scene_bgr * ratio, 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, lin * 12.92,
+                    1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+    return (srgb * 255.0 + 0.5).astype(np.uint8)
+
+
+def make_color_frames():
+    scene = build_color_scene()
+    return [render_color(scene, TIMES[i] / TIMES[REF]) for i in range(3)]
+
+
+def make_color_jpegs():
+    return [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+            for f in make_color_frames()]
+
+
+def patch_center(patch):
+    y0, y1, x0, x1 = patch
+    return (y0 + y1) // 2, (x0 + x1) // 2
+
+
+def test_per_channel_clipped_keeps_reference_color():
+    frames = make_color_frames()
+    masks = [np.full((H, W), 255, np.uint8) for _ in frames]
+    common = np.full((H, W), 255, np.uint8)
+    display, dynamic, uncertain, _ = classify_and_merge(
+        frames, TIMES, REF, masks, common)
+
+    r1 = patch_center(PATCH_R1)
+    r2 = patch_center(PATCH_R2)
+    r3 = patch_center(PATCH_R3)
+
+    # 场景静态，无运动
+    assert not dynamic[r1] and not dynamic[r2] and not dynamic[r3]
+
+    # R1：R 通道全组裁切 -> 保留参照值（=1，而非旧逻辑的 0），不偏色；
+    # B/G 仍为融合的真实辐射度；该像素部分缺失 -> 不确定
+    b1, g1, r1v = display[r1]
+    assert r1v > 0.99, f"缺失的 R 通道被写成 {r1v}（旧的零值偏色 bug）"
+    assert abs(b1 - 0.4) < 0.04 and abs(g1 - 0.25) < 0.04
+    assert uncertain[r1], "部分颜色通道缺失的像素必须标为不确定"
+
+    # R2：R 通道可从短曝光恢复 -> 三通道融合细节保留，像素确定
+    b2, g2, r2v = display[r2]
+    assert abs(r2v - 1.5) < 0.12, "可恢复的 R 通道应保留融合细节"
+    assert abs(b2 - 0.4) < 0.04 and abs(g2 - 0.25) < 0.04
+    assert not uncertain[r2], "三通道均可恢复时不应标为不确定"
+
+    # R3：三通道全组裁切 -> 保留参照（白）且不确定
+    assert abs(display[r3].mean() - 1.0) < 0.02
+    assert uncertain[r3]
+
+
+def test_per_channel_clipped_end_to_end():
+    """JPEG + 配准 + 色调映射全链路：成片不偏色、遮罩标对。"""
+    result = run_pipeline(make_color_jpegs(), TIMES, REF)
+    assert result["meta"]["overlap"] > 0.9
+    img = cv2.imdecode(np.frombuffer(result["result_png"], np.uint8),
+                       cv2.IMREAD_COLOR)
+    mask = cv2.imdecode(np.frombuffer(result["mask_png"], np.uint8),
+                        cv2.IMREAD_GRAYSCALE)
+
+    r1 = patch_center(PATCH_R1)
+    r2 = patch_center(PATCH_R2)
+    r3 = patch_center(PATCH_R3)
+    b1, g1, rc1 = (int(v) for v in img[r1])
+    # 旧 bug：R 写成 0 -> 蓝/绿压倒红（R 通道成片接近 0）；
+    # 修复后 R 通道保留参照高光值，经全局色调映射仍明显高于 B/G。
+    assert rc1 > b1 > g1, f"R 通道缺失导致成片偏色，得到 BGR=({b1},{g1},{rc1})"
+    assert rc1 > 120, f"缺失 R 通道被压成 {rc1}（旧的零值 bug）"
+    assert mask[r1] == 255, "部分通道缺失像素的遮罩漏标"
+    # 全通道可恢复 -> 确定；全通道裁切 -> 不确定
+    assert mask[r2] == 0
+    assert mask[r3] == 255
