@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>曝光包围去重影合成台</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>曝光包围照片去重影合成台</h1>
+  <p>上传 3～7 张同场景、同尺寸、固定光圈 / ISO / 白平衡的包围曝光 JPEG，
+     自动配准、抑制运动重影并合成 HDR 成片。</p>
+</header>
+
+<main>
+  <section class="card">
+    <label class="drop" for="files">
+      <input type="file" id="files" accept="image/jpeg,.jpg,.jpeg" multiple>
+      <strong>点击选择或拖入 3～7 张 JPEG 照片</strong>
+      <span class="hint">选择后为每张填写快门时间，并选定一张参照帧</span>
+    </label>
+
+    <div id="file-list"></div>
+
+    <div class="actions">
+      <button id="submit" disabled>开始合成</button>
+      <span id="form-hint" class="hint"></span>
+    </div>
+    <div id="error" class="error" hidden></div>
+    <div id="loading" class="loading" hidden>正在合成，请稍候…</div>
+  </section>
+
+  <section id="results" class="card" hidden>
+    <h2>参照帧 vs 合成成片</h2>
+    <div class="compare">
+      <figure>
+        <img id="ref-img" alt="参照帧">
+        <figcaption>参照帧</figcaption>
+      </figure>
+      <figure>
+        <img id="result-img" alt="合成成片">
+        <figcaption>合成成片</figcaption>
+      </figure>
+    </div>
+
+    <div class="downloads">
+      <a id="dl-result" class="btn" download="hdr_result.png">下载成片 PNG</a>
+      <a id="dl-mask" class="btn" download="uncertainty_mask.png">下载不确定遮罩 PNG</a>
+    </div>
+
+    <div class="mask-row">
+      <figure>
+        <img id="mask-img" alt="不确定遮罩">
+        <figcaption>不确定遮罩（白色 = 不确定，保留参照内容）</figcaption>
+      </figure>
+    </div>
+    <p id="meta" class="meta"></p>
+  </section>
+</main>
+
+<footer>
+  <span>静态区域按未裁切曝光加权融合恢复高光与暗部；运动物体仅保留参照帧位置。</span>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

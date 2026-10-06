@@ -1,0 +1,15 @@
+services:
+  hdr:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    image: hdr-deghost-studio
+    container_name: hdr-deghost-studio
+    ports:
+      - "8000:8000"
+    volumes:
+      - hdr_results:/app/results
+    restart: unless-stopped
+
+volumes:
+  hdr_results:
