@@ -14,6 +14,9 @@
 - 饱和裁切、曝光差异、配准残差不直接当作运动：曝光按快门时间补偿、
   裁切像素不参与比较、比较在模糊 + 邻域包络下进行。
 - 全组曝光都缺失或无法可靠判断的区域：保留参照内容并标为不确定。
+- 裁切与遮罩均逐通道裁决：静态像素若只有部分颜色通道在全部帧裁切，
+  可恢复的通道照常融合保留细节，缺失的通道保留参照帧该通道的值
+  （而不是写成零导致偏色），并把整个像素标为不确定。
 """
 
 from __future__ import annotations
@@ -238,6 +241,11 @@ def align(images: list[np.ndarray], ref_idx: int):
 def classify_and_merge(aligned, times, ref_idx, masks, common):
     """核心：逐像素分类（静态/动态）并融合。
 
+    融合权重逐通道累计。静态像素的每个通道独立裁决：
+    - 该通道至少有一帧有效曝光 -> 取多帧加权融合的辐射度（保留细节）；
+    - 该通道在全部帧过曝/欠曝裁切 -> 保留参照帧该通道的值（参照自身在
+      该通道必为裁切，即保留其裁切值），整像素标为不确定。
+
     返回 (display, dynamic, uncertain, common_b)：
     - display   : 参照曝光域的线性 HDR 结果（float32, HxWx3）
     - dynamic   : 动态区域布尔掩码
@@ -304,6 +312,9 @@ def classify_and_merge(aligned, times, ref_idx, masks, common):
     dynamic = (dyn_u > 0) & common_b
 
     # ---- 静态区域加权融合（Debevec 帽式权重，裁切处权重为 0）----
+    # 权重与累加都逐通道进行：某通道在全部帧裁切时 wsum 对应通道为 0，
+    # 此时只能裁决该通道缺失，不能因为其它通道有权重就把整像素当作
+    # 可恢复（否则缺失通道被写成零 -> 偏色，且遮罩漏标）。
     acc = np.zeros((h, w, 3), np.float32)
     wsum = np.zeros((h, w, 3), np.float32)
     for i in range(n):
@@ -313,20 +324,26 @@ def classify_and_merge(aligned, times, ref_idx, masks, common):
         wgt *= (masks[i] > 0)[..., None].astype(np.float32)
         acc += wgt * (_to_linear(aligned[i]) / t[i])
         wsum += wgt
-    has_data = wsum.max(axis=2) > 1e-6
-    radiance = np.where(wsum > 1e-6, acc / np.maximum(wsum, 1e-6), 0.0)
+    chan_ok = wsum > 1e-6                    # 逐通道：该通道至少有一帧有效曝光
+    radiance = np.where(chan_ok, acc / np.maximum(wsum, 1e-6), 0.0)
 
     ref_radiance = ref_lin / t_ref
-    out = np.where(has_data[..., None], radiance, ref_radiance)
+    static = common_b & ~dynamic
+    # 静态区域逐通道裁决：可恢复的通道取多帧融合值（保留细节），
+    # 全组裁切的通道保留参照帧该通道的值（参照自身在该通道必为裁切，
+    # 即保留其过曝/欠曝值），而不是写成零造成偏色。
+    use_rad = chan_ok | ~static[..., None]
+    out = np.where(use_rad, radiance, ref_radiance)
     out = np.where(dynamic[..., None], ref_radiance, out)   # 动态：只用参照
     out = np.where(common_b[..., None], out, ref_radiance)  # 重叠区外：参照
     display = out * t_ref                                    # 回到参照曝光域
 
     # ---- 不确定区域：保留参照内容并标注 ----
     ref_clipped = ref_hi | ref_lo
+    all_channels_ok = chan_ok.all(axis=2)
     uncertain = ((~common_b)                       # 非公共重叠区，只有参照可用
                  | (dynamic & ref_clipped)         # 动态且参照已裁切，无法恢复
-                 | (~has_data & ~dynamic))         # 全组曝光都缺失细节
+                 | (static & ~all_channels_ok))    # 静态但至少一个通道全组缺失
     return display.astype(np.float32), dynamic, uncertain, common_b
 
 

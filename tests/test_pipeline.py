@@ -129,6 +129,114 @@ def test_classify_and_merge_static_and_dynamic():
 
 
 # ---------------------------------------------------------------------------
+# 单元级：彩色单通道裁切 —— 某通道全组裁切、其余通道可恢复
+# ---------------------------------------------------------------------------
+
+CH, CW = 160, 200
+CTIMES = [0.25, 1.0, 2.0]   # 参照帧索引 1
+CREF = 1
+# B 通道全组高光裁切块（R/G 中性），与 B 通道全组欠曝裁切块
+HI_BBOX = (140, 30, 40, 30)    # (x, y, w, h)
+LO_BBOX = (20, 110, 40, 30)
+
+
+def _build_color_scene():
+    """逐通道线性辐射度（以参照曝光为单位）：中性纹理背景 + 两个单色裁切块。"""
+    rng = np.random.default_rng(7)
+    noise = rng.normal(0.0, 1.0, (CH, CW)).astype(np.float32)
+    tex = (0.05 * cv2.GaussianBlur(noise, (0, 0), 1.0) /
+           max(cv2.GaussianBlur(noise, (0, 0), 1.0).std(), 1e-6))
+    base = 0.35 * (1.0 + tex)               # 中性 R=G=B≈0.35，三档曝光都不裁切
+    rad = np.repeat(base[..., None], 3, axis=2)
+    x, y, w, h = HI_BBOX
+    # B=20：短曝光 5.0 仍饱和；R=0.30 / G=0.40 在全部帧均可恢复（BGR 序）
+    rad[y:y + h, x:x + w] = (20.0, 0.40, 0.30)
+    x, y, w, h = LO_BBOX
+    # B≈0.0003：长曝光仍欠曝；R=0.25 / G=0.35 在全部帧均可恢复（BGR 序）
+    rad[y:y + h, x:x + w] = (0.0003, 0.35, 0.25)
+    return rad
+
+
+def _render_color(rad, ratio):
+    lin = np.clip(rad * ratio, 0.0, 1.0)
+    srgb = np.where(lin <= 0.0031308, lin * 12.92,
+                    1.055 * np.power(lin, 1.0 / 2.4) - 0.055)
+    return (srgb * 255.0 + 0.5).astype(np.uint8)   # 已是 BGR 通道序
+
+
+def make_color_frames():
+    rad = _build_color_scene()
+    return [_render_color(rad, CTIMES[i] / CTIMES[CREF])
+            for i in range(len(CTIMES))]
+
+
+def make_color_jpegs():
+    return [cv2.imencode(".jpg", f, [cv2.IMWRITE_JPEG_QUALITY, 95])[1].tobytes()
+            for f in make_color_frames()]
+
+
+def _bbox_center(bbox):
+    x, y, w, h = bbox
+    return y + h // 2, x + w // 2                 # (row, col)
+
+
+def test_partial_channel_clipping_unit():
+    """静态区域：单通道全组裁切时保留参照值、其余通道照常融合，并标不确定。"""
+    frames = make_color_frames()
+    masks = [np.full((CH, CW), 255, np.uint8) for _ in frames]
+    common = np.full((CH, CW), 255, np.uint8)
+    display, dynamic, uncertain, _ = classify_and_merge(
+        frames, CTIMES, CREF, masks, common)
+
+    # --- B 通道全组过曝块 ---
+    r, c = _bbox_center(HI_BBOX)
+    assert not dynamic[r, c]
+    assert uncertain[r, c], "单通道缺失的像素应标为不确定"
+    # 缺失的 B：保留参照值（参照 B 已裁切 -> 1.0），不得写成 0
+    assert display[r, c, 0] > 0.99, "缺失的蓝通道被写成零，导致偏色"
+    # 可恢复的 R/G 仍保留细节（真实辐射度 0.30 / 0.40）
+    assert abs(display[r, c, 2] - 0.30) < 0.04
+    assert abs(display[r, c, 1] - 0.40) < 0.04
+
+    # --- B 通道全组欠曝块 ---
+    r, c = _bbox_center(LO_BBOX)
+    assert not dynamic[r, c]
+    assert uncertain[r, c], "单通道缺失的像素应标为不确定"
+    assert display[r, c, 0] < 0.005, "缺失的蓝通道应保留参照裁切值（≈0）"
+    assert abs(display[r, c, 2] - 0.25) < 0.04
+    assert abs(display[r, c, 1] - 0.35) < 0.04
+
+    # --- 中性背景：三通道均可恢复，融合且确定 ---
+    assert not uncertain[70, 100]
+    expected = _build_color_scene()[70, 100]
+    assert np.abs(display[70, 100] - expected).max() < 0.03
+
+
+def test_partial_channel_clipping_e2e():
+    """完整流水线：成片中缺失通道保留参照值（过曝仍为亮蓝），遮罩标白。"""
+    result = run_pipeline(make_color_jpegs(), CTIMES, CREF)
+    img = cv2.imdecode(np.frombuffer(result["result_png"], np.uint8),
+                       cv2.IMREAD_COLOR)
+    mask = cv2.imdecode(np.frombuffer(result["mask_png"], np.uint8),
+                        cv2.IMREAD_GRAYSCALE)
+
+    r, c = _bbox_center(HI_BBOX)
+    assert mask[r, c] == 255, "遮罩漏标部分缺失的像素"
+    # 蓝通道不得塌陷为零：保留参照高光值（色调映射后仍显著亮于 0）
+    assert int(img[r, c, 0]) > 100, "成片蓝通道被写成零（偏色）"
+    # 中性的 R/G 未过曝，成片应明显暗于 255
+    assert int(img[r, c, 1]) < 235
+    assert int(img[r, c, 2]) < 235
+
+    r, c = _bbox_center(LO_BBOX)
+    assert mask[r, c] == 255
+    assert int(img[r, c, 0]) < 30, "欠曝蓝通道应保持参照暗值"
+    assert int(img[r, c, 1]) > 60, "可恢复的绿通道应保留细节"
+
+    assert mask[70, 100] == 0
+
+
+# ---------------------------------------------------------------------------
 # 集成级：走完整流水线（JPEG 编解码 + 配准 + 融合 + 色调映射）
 # ---------------------------------------------------------------------------
 
